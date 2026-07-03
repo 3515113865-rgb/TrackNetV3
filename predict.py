@@ -83,7 +83,7 @@ if __name__ == '__main__':
     parser.add_argument('--traj_len', type=int, default=8, help='length of trajectory to draw on video')
     args = parser.parse_args()
 
-    num_workers = args.batch_size if args.batch_size <= 16 else 16
+    num_workers = 0
     video_file = args.video_file
     video_name = video_file.split('/')[-1][:-4]
     video_range = args.video_range if args.video_range else None
