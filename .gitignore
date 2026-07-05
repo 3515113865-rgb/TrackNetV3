@@ -19,3 +19,7 @@ predict_old.py
 prediction_tracknet_only/
 predict.py.bak
 prediction_adaptive_safe/
+prediction_tracknet_inpaint/
+prediction_tracknet_tiled/
+prediction_tracknet_adaptive/
+.venv/
