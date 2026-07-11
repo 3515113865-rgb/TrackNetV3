@@ -59,6 +59,48 @@ def read_video_frames(video_file: str) -> tuple[list[np.ndarray], float, int, in
     return frames, fps, width, height
 
 
+def video_metadata(video_file: str) -> tuple[int, float, int, int]:
+    cap = cv2.VideoCapture(video_file)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_file}")
+    try:
+        return (int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), float(cap.get(cv2.CAP_PROP_FPS) or 30.0), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    finally:
+        cap.release()
+
+
+def segment_ranges(total_frames: int, segment_frames: int = 180, overlap: int = 12) -> list[tuple[int, int]]:
+    if total_frames <= 0:
+        return []
+    if segment_frames <= overlap or overlap < 0:
+        raise ValueError("segment_frames must be greater than segment_overlap")
+    ranges, start = [], 0
+    while start < total_frames:
+        end = min(total_frames, start + segment_frames)
+        ranges.append((start, end))
+        if end == total_frames:
+            break
+        start = end - overlap
+    return ranges
+
+
+def read_frame_range(video_file: str, start: int, end: int) -> list[np.ndarray]:
+    cap = cv2.VideoCapture(video_file)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_file}")
+    frames = []
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+        for _ in range(start, end):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames.append(frame)
+    finally:
+        cap.release()
+    return frames
+
+
 def bgr_to_rgb_array(frames: Iterable[np.ndarray]) -> np.ndarray:
     return np.array([frame[:, :, ::-1] for frame in frames])
 
@@ -105,6 +147,7 @@ def run_tracknet_heatmap(
     offset: tuple[int, int] = (0, 0),
     eval_mode: str = "weight",
     progress_desc: str = "TrackNet",
+    background_sample_frames: int = 64,
 ) -> list[HeatmapDetection]:
     if not frames_bgr:
         return []
@@ -113,12 +156,17 @@ def run_tracknet_heatmap(
 
     tile_h, tile_w = frames_bgr[0].shape[:2]
     img_scaler = (tile_w / WIDTH, tile_h / HEIGHT)
+    rgb_frames = bgr_to_rgb_array(frames_bgr)
+    sample_count = min(len(rgb_frames), max(1, background_sample_frames))
+    sample_indices = np.linspace(0, len(rgb_frames) - 1, sample_count, dtype=int)
+    median = np.median(rgb_frames[sample_indices], axis=0) if bg_mode else None
     dataset = Shuttlecock_Trajectory_Dataset(
         seq_len=seq_len,
         sliding_step=1,
         data_mode="heatmap",
         bg_mode=bg_mode,
-        frame_arr=bgr_to_rgb_array(frames_bgr),
+        frame_arr=rgb_frames,
+        median=median,
     )
     loader = DataLoader(
         dataset,

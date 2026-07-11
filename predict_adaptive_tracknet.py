@@ -16,9 +16,12 @@ from tqdm import tqdm
 from dataset import Shuttlecock_Trajectory_Dataset
 from test import generate_inpaint_mask, get_ensemble_weight
 from tracknet_inference_core import (
+    HeatmapDetection,
     load_inpaintnet,
     load_tracknet,
-    read_video_frames,
+    read_frame_range,
+    segment_ranges,
+    video_metadata,
     run_tracknet_heatmap,
 )
 from utils.general import COOR_TH
@@ -49,6 +52,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_deviation", type=float, default=35.0)
     parser.add_argument("--max_step", type=float, default=120.0)
     parser.add_argument("--corridor_margin", type=float, default=160.0)
+    parser.add_argument("--segment_frames", type=int, default=180)
+    parser.add_argument("--segment_overlap", type=int, default=12)
+    parser.add_argument("--background_sample_frames", type=int, default=64)
     return parser.parse_args()
 
 
@@ -486,22 +492,21 @@ def main() -> None:
     video_stem = Path(args.video_file).stem
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    frames, fps, width, height = read_video_frames(args.video_file)
-    total_frames = len(frames)
+    total_frames, fps, width, height = video_metadata(args.video_file)
     tracknet, tracknet_seq_len, bg_mode = load_tracknet(args.tracknet_file, device)
 
     full_started = time.time()
-    full_dets = run_tracknet_heatmap(
-        frames_bgr=frames,
-        frame_ids=list(range(total_frames)),
-        model=tracknet,
-        seq_len=tracknet_seq_len,
-        bg_mode=bg_mode,
-        batch_size=args.batch_size,
-        threshold=args.strong_threshold,
-        device=device,
-        progress_desc="Full-frame TrackNet",
-    )
+    full_by_frame = {}
+    segment_plan = segment_ranges(total_frames, args.segment_frames, args.segment_overlap)
+    for segment_index, (start, end) in enumerate(segment_plan):
+        segment = read_frame_range(args.video_file, start, end)
+        detections = run_tracknet_heatmap(frames_bgr=segment, frame_ids=list(range(start, start + len(segment))), model=tracknet, seq_len=tracknet_seq_len, bg_mode=bg_mode, batch_size=args.batch_size, threshold=args.strong_threshold, device=device, progress_desc=f"Full-frame segment {segment_index + 1}/{len(segment_plan)}", background_sample_frames=args.background_sample_frames)
+        for detection in detections:
+            previous = full_by_frame.get(detection.frame)
+            if previous is None or detection.confidence > previous.confidence:
+                full_by_frame[detection.frame] = detection
+        del segment
+    full_dets = [full_by_frame.get(frame, HeatmapDetection(frame, 0, 0.0, 0.0, 0.0)) for frame in range(total_frames)]
     elapsed_full = time.time() - full_started
     full_df = pd.DataFrame(
         {
@@ -539,7 +544,8 @@ def main() -> None:
                 ):
                     active_tiles[tile.index] = tile
             for tile in active_tiles.values():
-                tile_frames = [frames[f][tile.y1:tile.y2, tile.x1:tile.x2] for f in range_frames]
+                range_buffer = read_frame_range(args.video_file, range_frames[0], range_frames[-1] + 1)
+                tile_frames = [frame[tile.y1:tile.y2, tile.x1:tile.x2] for frame in range_buffer]
                 detections = run_tracknet_heatmap(
                     frames_bgr=tile_frames,
                     frame_ids=range_frames,
@@ -549,10 +555,12 @@ def main() -> None:
                     batch_size=args.batch_size,
                     threshold=args.candidate_threshold,
                     device=device,
+                    background_sample_frames=args.background_sample_frames,
                     offset=(tile.x1, tile.y1),
                     progress_desc=f"Tile {tile.index}",
                 )
                 tile_inference_frame_count += len(tile_frames)
+                del tile_frames, range_buffer
                 for det in detections:
                     if det.confidence < args.candidate_threshold:
                         continue
@@ -603,6 +611,7 @@ def main() -> None:
 
     inpaint_count = 0
     rejected_long_inpaint = 0
+    inpaint_started = time.time()
     if args.inpaintnet_file:
         inpaintnet, inpaint_seq_len = load_inpaintnet(args.inpaintnet_file, device)
         inpaint_outputs = run_inpaint(inpaintnet, inpaint_seq_len, result, width, height, args.batch_size, device)
@@ -616,6 +625,7 @@ def main() -> None:
             height,
             fps,
         )
+    elapsed_inpaint = time.time() - inpaint_started
 
     final_columns = [
         "Frame", "Visibility", "X", "Y", "Confidence", "Source", "SegmentId",
@@ -631,6 +641,11 @@ def main() -> None:
         "video_height": height,
         "fps": fps,
         "total_frames": total_frames,
+        "processing_mode": "chunked",
+        "segment_frames": args.segment_frames,
+        "segment_overlap": args.segment_overlap,
+        "segment_count": len(segment_plan),
+        "background_sample_frames": min(args.background_sample_frames, args.segment_frames),
         "aspect_ratio": width / height,
         "full_frame_visible_count": int((full_df["Visibility"].astype(int) == 1).sum()),
         "full_frame_visibility_ratio": float((full_df["Visibility"].astype(int) == 1).mean()),
@@ -653,6 +668,10 @@ def main() -> None:
         "trajectory_segment_count": int(result.loc[result["SegmentId"].astype(int) >= 0, "SegmentId"].nunique()),
         "elapsed_full_frame_sec": elapsed_full,
         "elapsed_tile_sec": elapsed_tile,
+        "full_frame_elapsed_sec": elapsed_full,
+        "tile_recovery_elapsed_sec": elapsed_tile,
+        "inpaint_elapsed_sec": elapsed_inpaint,
+        "render_elapsed_sec": 0.0,
         "elapsed_total_sec": time.time() - started,
         "outputs": {
             "full_frame_raw_csv": str(full_csv),
