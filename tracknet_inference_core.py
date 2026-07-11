@@ -23,7 +23,9 @@ class HeatmapDetection:
     confidence: float
 
 
-def load_tracknet(tracknet_file: str, device: torch.device):
+def load_tracknet(tracknet_file: str, device: torch.device, profiler=None):
+    if profiler:
+        profiler.add_count("tracknet_model_load_count")
     ckpt = torch.load(tracknet_file, map_location=device)
     seq_len = int(ckpt["param_dict"]["seq_len"])
     bg_mode = ckpt["param_dict"]["bg_mode"]
@@ -33,7 +35,9 @@ def load_tracknet(tracknet_file: str, device: torch.device):
     return model, seq_len, bg_mode
 
 
-def load_inpaintnet(inpaintnet_file: str, device: torch.device):
+def load_inpaintnet(inpaintnet_file: str, device: torch.device, profiler=None):
+    if profiler:
+        profiler.add_count("inpaintnet_model_load_count")
     ckpt = torch.load(inpaintnet_file, map_location=device)
     seq_len = int(ckpt["param_dict"]["seq_len"])
     model = get_model("InpaintNet").to(device)
@@ -59,7 +63,9 @@ def read_video_frames(video_file: str) -> tuple[list[np.ndarray], float, int, in
     return frames, fps, width, height
 
 
-def video_metadata(video_file: str) -> tuple[int, float, int, int]:
+def video_metadata(video_file: str, profiler=None) -> tuple[int, float, int, int]:
+    if profiler:
+        profiler.add_count("video_open_count")
     cap = cv2.VideoCapture(video_file)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_file}")
@@ -84,7 +90,9 @@ def segment_ranges(total_frames: int, segment_frames: int = 180, overlap: int = 
     return ranges
 
 
-def read_frame_range(video_file: str, start: int, end: int) -> list[np.ndarray]:
+def read_frame_range(video_file: str, start: int, end: int, profiler=None) -> list[np.ndarray]:
+    if profiler:
+        profiler.add_count("video_open_count")
     cap = cv2.VideoCapture(video_file)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_file}")
@@ -96,6 +104,8 @@ def read_frame_range(video_file: str, start: int, end: int) -> list[np.ndarray]:
             if not ok:
                 break
             frames.append(frame)
+            if profiler:
+                profiler.add_count("decoded_frame_count")
     finally:
         cap.release()
     return frames
@@ -148,7 +158,13 @@ def run_tracknet_heatmap(
     eval_mode: str = "weight",
     progress_desc: str = "TrackNet",
     background_sample_frames: int = 64,
+    profiler=None,
+    profile_prefix: str = "full_frame",
 ) -> list[HeatmapDetection]:
+    pipeline_started = __import__("time").perf_counter()
+    inference_before = profiler.timings.get(f"{profile_prefix}_inference", 0.0) if profiler else 0.0
+    background_before = profiler.timings.get("background_estimation", 0.0) if profiler else 0.0
+    preparation_before = profiler.timings.get(f"{profile_prefix}_preparation", 0.0) if profiler else 0.0
     if not frames_bgr:
         return []
     if len(frames_bgr) != len(frame_ids):
@@ -156,25 +172,18 @@ def run_tracknet_heatmap(
 
     tile_h, tile_w = frames_bgr[0].shape[:2]
     img_scaler = (tile_w / WIDTH, tile_h / HEIGHT)
-    rgb_frames = bgr_to_rgb_array(frames_bgr)
-    sample_count = min(len(rgb_frames), max(1, background_sample_frames))
-    sample_indices = np.linspace(0, len(rgb_frames) - 1, sample_count, dtype=int)
-    median = np.median(rgb_frames[sample_indices], axis=0) if bg_mode else None
-    dataset = Shuttlecock_Trajectory_Dataset(
-        seq_len=seq_len,
-        sliding_step=1,
-        data_mode="heatmap",
-        bg_mode=bg_mode,
-        frame_arr=rgb_frames,
-        median=median,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        drop_last=False,
-    )
+    stage = profiler.stage if profiler else None
+    with stage("background_estimation") if stage else _nullcontext():
+        rgb_frames = bgr_to_rgb_array(frames_bgr)
+        sample_count = min(len(rgb_frames), max(1, background_sample_frames))
+        sample_indices = np.linspace(0, len(rgb_frames) - 1, sample_count, dtype=int)
+        median = np.median(rgb_frames[sample_indices], axis=0) if bg_mode else None
+        if profiler and bg_mode:
+            profiler.add_count("background_estimation_count")
+            profiler.add_count("background_sampled_frames", sample_count)
+    with stage(f"{profile_prefix}_preparation") if stage else _nullcontext():
+        dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=1, data_mode="heatmap", bg_mode=bg_mode, frame_arr=rgb_frames, median=median)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, drop_last=False)
 
     video_len = len(frames_bgr)
     buffer_size = seq_len - 1
@@ -189,7 +198,10 @@ def run_tracknet_heatmap(
     with torch.no_grad():
         for i, x in tqdm(loader, desc=progress_desc):
             x = x.float().to(device)
-            y_pred = model(x).detach().cpu()
+            if profiler:
+                profiler.observe_inference(model, x)
+            with stage(f"{profile_prefix}_inference", synchronize_cuda=True) if stage else _nullcontext():
+                y_pred = model(x).detach().cpu()
             y_pred_buffer = torch.cat((y_pred_buffer, y_pred), dim=0)
             b_size = int(i.shape[0])
 
@@ -213,19 +225,34 @@ def run_tracknet_heatmap(
 
             y_pred_buffer = y_pred_buffer[-buffer_size:]
 
-    detections: list[HeatmapDetection] = []
-    for local_frame, global_frame in enumerate(frame_ids):
-        heatmap = heatmaps_by_local_frame.get(local_frame)
-        if heatmap is None:
-            detections.append(HeatmapDetection(global_frame, 0, 0.0, 0.0, 0.0))
-        else:
-            detections.append(
-                heatmap_to_detection(
-                    global_frame,
-                    heatmap,
-                    img_scaler,
-                    threshold,
-                    offset=offset,
+    with stage("coordinate_mapping") if stage else _nullcontext():
+        detections: list[HeatmapDetection] = []
+        for local_frame, global_frame in enumerate(frame_ids):
+            heatmap = heatmaps_by_local_frame.get(local_frame)
+            if heatmap is None:
+                detections.append(HeatmapDetection(global_frame, 0, 0.0, 0.0, 0.0))
+            else:
+                detections.append(
+                    heatmap_to_detection(
+                        global_frame,
+                        heatmap,
+                        img_scaler,
+                        threshold,
+                        offset=offset,
+                    )
                 )
-            )
+    if profiler:
+        pipeline_elapsed = __import__("time").perf_counter() - pipeline_started
+        inference_elapsed = profiler.timings.get(f"{profile_prefix}_inference", 0.0) - inference_before
+        background_elapsed = profiler.timings.get("background_estimation", 0.0) - background_before
+        measured_setup = profiler.timings.get(f"{profile_prefix}_preparation", 0.0) - preparation_before
+        profiler.add_time(f"{profile_prefix}_preparation", max(0.0, pipeline_elapsed - inference_elapsed - background_elapsed - measured_setup))
     return detections
+
+
+class _nullcontext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *args):
+        return False

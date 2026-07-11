@@ -25,6 +25,7 @@ from tracknet_inference_core import (
     run_tracknet_heatmap,
 )
 from utils.general import COOR_TH
+from tracknet_profiler import TrackNetProfiler
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--segment_frames", type=int, default=180)
     parser.add_argument("--segment_overlap", type=int, default=12)
     parser.add_argument("--background_sample_frames", type=int, default=64)
+    parser.add_argument("--profile", action="store_true")
     return parser.parse_args()
 
 
@@ -486,28 +488,41 @@ def apply_safe_inpaint(
 
 def main() -> None:
     args = parse_args()
-    started = time.time()
+    started = time.perf_counter()
+    profiler = TrackNetProfiler(args.profile)
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     video_stem = Path(args.video_file).stem
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    total_frames, fps, width, height = video_metadata(args.video_file)
-    tracknet, tracknet_seq_len, bg_mode = load_tracknet(args.tracknet_file, device)
+    with profiler.stage("video_metadata"):
+        total_frames, fps, width, height = video_metadata(args.video_file, profiler)
+    with profiler.stage("model_load"):
+        tracknet, tracknet_seq_len, bg_mode = load_tracknet(args.tracknet_file, device, profiler)
+    profiler.sample_memory("after_model_load")
 
-    full_started = time.time()
+    full_started = time.perf_counter()
     full_by_frame = {}
     segment_plan = segment_ranges(total_frames, args.segment_frames, args.segment_overlap)
     for segment_index, (start, end) in enumerate(segment_plan):
-        segment = read_frame_range(args.video_file, start, end)
-        detections = run_tracknet_heatmap(frames_bgr=segment, frame_ids=list(range(start, start + len(segment))), model=tracknet, seq_len=tracknet_seq_len, bg_mode=bg_mode, batch_size=args.batch_size, threshold=args.strong_threshold, device=device, progress_desc=f"Full-frame segment {segment_index + 1}/{len(segment_plan)}", background_sample_frames=args.background_sample_frames)
+        segment_started = time.perf_counter()
+        with profiler.stage("video_decode"):
+            segment = read_frame_range(args.video_file, start, end, profiler)
+        inference_before = profiler.timings.get("full_frame_inference", 0.0)
+        detections = run_tracknet_heatmap(frames_bgr=segment, frame_ids=list(range(start, start + len(segment))), model=tracknet, seq_len=tracknet_seq_len, bg_mode=bg_mode, batch_size=args.batch_size, threshold=args.strong_threshold, device=device, progress_desc=f"Full-frame segment {segment_index + 1}/{len(segment_plan)}", background_sample_frames=args.background_sample_frames, profiler=profiler, profile_prefix="full_frame")
+        merge_started = time.perf_counter()
         for detection in detections:
             previous = full_by_frame.get(detection.frame)
             if previous is None or detection.confidence > previous.confidence:
                 full_by_frame[detection.frame] = detection
+        merge_sec = time.perf_counter() - merge_started
+        profiler.add_time("overlap_merge", merge_sec)
+        profiler.add_count("full_frame_processed_frames", len(segment))
+        profiler.segments.append({"segment_index": segment_index, "start_frame": start, "end_frame": end - 1, "frame_count": len(segment), "overlap_frame_count": 0 if segment_index == 0 else min(args.segment_overlap, len(segment)), "inference_sec": profiler.timings.get("full_frame_inference", 0.0) - inference_before, "merge_sec": merge_sec, "elapsed_sec": time.perf_counter() - segment_started, "detected_frame_count": sum(d.visibility for d in detections)})
+        profiler.sample_memory(f"segment_{segment_index}_end")
         del segment
     full_dets = [full_by_frame.get(frame, HeatmapDetection(frame, 0, 0.0, 0.0, 0.0)) for frame in range(total_frames)]
-    elapsed_full = time.time() - full_started
+    elapsed_full = time.perf_counter() - full_started
     full_df = pd.DataFrame(
         {
             "Frame": [det.frame for det in full_dets],
@@ -519,19 +534,23 @@ def main() -> None:
         }
     )
     full_csv = save_dir / f"{video_stem}_full_frame_raw.csv"
-    full_df.to_csv(full_csv, index=False)
+    with profiler.stage("csv_write"):
+        full_df.to_csv(full_csv, index=False)
 
-    intervals = find_missing_intervals(full_df)
+    with profiler.stage("missing_interval_detection"):
+        intervals = find_missing_intervals(full_df)
     intervals_json = save_dir / f"{video_stem}_missing_intervals.json"
     intervals_json.write_text(json.dumps(intervals, indent=2), encoding="utf-8")
     ranges = merge_supplement_ranges(intervals, total_frames, args.context_frames, args.tiling_mode)
     tiles = generate_adaptive_tiles(width, height, args.max_tiles)
-    tile_started = time.time()
+    tile_started = time.perf_counter()
     candidate_rows: list[dict] = []
     tile_inference_frame_count = 0
 
     if args.tiling_mode != "off":
         for supplement_range in ranges:
+            range_started = time.perf_counter()
+            range_tile_count = 0
             range_frames = list(range(supplement_range["start"], supplement_range["end"] + 1))
             active_tiles: dict[int, Tile] = {}
             for interval_id in supplement_range["interval_ids"]:
@@ -544,7 +563,9 @@ def main() -> None:
                 ):
                     active_tiles[tile.index] = tile
             for tile in active_tiles.values():
-                range_buffer = read_frame_range(args.video_file, range_frames[0], range_frames[-1] + 1)
+                range_tile_count += 1
+                with profiler.stage("video_decode"):
+                    range_buffer = read_frame_range(args.video_file, range_frames[0], range_frames[-1] + 1, profiler)
                 tile_frames = [frame[tile.y1:tile.y2, tile.x1:tile.x2] for frame in range_buffer]
                 detections = run_tracknet_heatmap(
                     frames_bgr=tile_frames,
@@ -558,6 +579,8 @@ def main() -> None:
                     background_sample_frames=args.background_sample_frames,
                     offset=(tile.x1, tile.y1),
                     progress_desc=f"Tile {tile.index}",
+                    profiler=profiler,
+                    profile_prefix="tile_recovery",
                 )
                 tile_inference_frame_count += len(tile_frames)
                 del tile_frames, range_buffer
@@ -582,8 +605,14 @@ def main() -> None:
                             "RejectReason": "",
                         }
                     )
+            profiler.tile_intervals.append({"start_frame": supplement_range["start"], "end_frame": supplement_range["end"], "interval_ids": supplement_range["interval_ids"], "tile_count": range_tile_count, "processed_frames": len(range_frames) * range_tile_count, "elapsed_sec": time.perf_counter() - range_started})
 
-    elapsed_tile = time.time() - tile_started
+    elapsed_tile = time.perf_counter() - tile_started
+    profiler.add_count("missing_interval_count", len(intervals))
+    profiler.add_count("missing_interval_total_frames", sum(x["length"] for x in intervals))
+    profiler.add_count("tile_recovery_interval_count", len(ranges))
+    profiler.add_count("tile_recovery_processed_frames", tile_inference_frame_count)
+    profiler.sample_memory("after_tile_recovery")
     candidates = pd.DataFrame(candidate_rows)
     if not candidates.empty:
         candidates = dedupe_candidates(candidates)
@@ -596,25 +625,20 @@ def main() -> None:
             ]
         )
     candidates_csv = save_dir / f"{video_stem}_adaptive_candidates.csv"
-    candidates.to_csv(candidates_csv, index=False)
+    with profiler.stage("csv_write"):
+        candidates.to_csv(candidates_csv, index=False)
 
-    result, accepted_tile, rejected_tile = fuse_results(
-        full_df,
-        candidates,
-        intervals,
-        width,
-        height,
-        fps,
-        args.max_step,
-        args.strong_threshold,
-    )
+    with profiler.stage("tile_result_merge"):
+        result, accepted_tile, rejected_tile = fuse_results(full_df, candidates, intervals, width, height, fps, args.max_step, args.strong_threshold)
 
     inpaint_count = 0
     rejected_long_inpaint = 0
-    inpaint_started = time.time()
+    inpaint_started = time.perf_counter()
     if args.inpaintnet_file:
-        inpaintnet, inpaint_seq_len = load_inpaintnet(args.inpaintnet_file, device)
-        inpaint_outputs = run_inpaint(inpaintnet, inpaint_seq_len, result, width, height, args.batch_size, device)
+        with profiler.stage("inpaint_model_load"):
+            inpaintnet, inpaint_seq_len = load_inpaintnet(args.inpaintnet_file, device, profiler)
+        with profiler.stage("short_gap_inpaint", synchronize_cuda=True):
+            inpaint_outputs = run_inpaint(inpaintnet, inpaint_seq_len, result, width, height, args.batch_size, device)
         result, inpaint_count, rejected_long_inpaint = apply_safe_inpaint(
             result,
             inpaint_outputs,
@@ -625,7 +649,7 @@ def main() -> None:
             height,
             fps,
         )
-    elapsed_inpaint = time.time() - inpaint_started
+    elapsed_inpaint = time.perf_counter() - inpaint_started
 
     final_columns = [
         "Frame", "Visibility", "X", "Y", "Confidence", "Source", "SegmentId",
@@ -634,7 +658,8 @@ def main() -> None:
     result = result[final_columns]
     result["Source"] = result["Source"].where(result["Visibility"].astype(int) == 1, "missing")
     safe_csv = save_dir / f"{video_stem}_ball_adaptive_safe.csv"
-    result.to_csv(safe_csv, index=False)
+    with profiler.stage("csv_write"):
+        result.to_csv(safe_csv, index=False)
 
     debug = {
         "video_width": width,
@@ -672,7 +697,7 @@ def main() -> None:
         "tile_recovery_elapsed_sec": elapsed_tile,
         "inpaint_elapsed_sec": elapsed_inpaint,
         "render_elapsed_sec": 0.0,
-        "elapsed_total_sec": time.time() - started,
+        "elapsed_total_sec": time.perf_counter() - started,
         "outputs": {
             "full_frame_raw_csv": str(full_csv),
             "missing_intervals_json": str(intervals_json),
@@ -682,6 +707,12 @@ def main() -> None:
     }
     debug_json = save_dir / f"{video_stem}_adaptive_debug.json"
     debug_json.write_text(json.dumps(debug, indent=2), encoding="utf-8")
+
+    if args.profile:
+        profiler.add_count("unique_source_frames", total_frames)
+        profiler.add_count("overlap_reprocessed_frames", sum(max(0, item[1] - item[0]) for item in segment_plan) - total_frames)
+        profiler.add_count("detected_frame_count", debug["final_visible_count"])
+        profiler.finalize(save_dir / f"{video_stem}_performance_profile.json", device=device, video={"path": args.video_file, "width": width, "height": height, "fps": fps, "frame_count": total_frames, "duration_sec": total_frames / fps if fps else 0}, configuration={"segment_frames": args.segment_frames, "segment_overlap": args.segment_overlap, "segment_count": len(segment_plan), "batch_size": args.batch_size, "background_sample_frames": args.background_sample_frames, "tiling_mode": args.tiling_mode, "max_tiles": args.max_tiles})
 
     print("device =", device)
     print("full_frame_visible_count =", debug["full_frame_visible_count"])
