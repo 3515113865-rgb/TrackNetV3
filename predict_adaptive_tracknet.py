@@ -17,6 +17,9 @@ from dataset import Shuttlecock_Trajectory_Dataset
 from test import generate_inpaint_mask, get_ensemble_weight
 from tracknet_inference_core import (
     HeatmapDetection,
+    VideoSegmentReader,
+    VideoRangeReader,
+    estimate_frame_background,
     load_inpaintnet,
     load_tracknet,
     read_frame_range,
@@ -504,23 +507,27 @@ def main() -> None:
     full_started = time.perf_counter()
     full_by_frame = {}
     segment_plan = segment_ranges(total_frames, args.segment_frames, args.segment_overlap)
-    for segment_index, (start, end) in enumerate(segment_plan):
-        segment_started = time.perf_counter()
-        with profiler.stage("video_decode"):
-            segment = read_frame_range(args.video_file, start, end, profiler)
-        inference_before = profiler.timings.get("full_frame_inference", 0.0)
-        detections = run_tracknet_heatmap(frames_bgr=segment, frame_ids=list(range(start, start + len(segment))), model=tracknet, seq_len=tracknet_seq_len, bg_mode=bg_mode, batch_size=args.batch_size, threshold=args.strong_threshold, device=device, progress_desc=f"Full-frame segment {segment_index + 1}/{len(segment_plan)}", background_sample_frames=args.background_sample_frames, profiler=profiler, profile_prefix="full_frame")
-        merge_started = time.perf_counter()
-        for detection in detections:
-            previous = full_by_frame.get(detection.frame)
-            if previous is None or detection.confidence > previous.confidence:
-                full_by_frame[detection.frame] = detection
-        merge_sec = time.perf_counter() - merge_started
-        profiler.add_time("overlap_merge", merge_sec)
-        profiler.add_count("full_frame_processed_frames", len(segment))
-        profiler.segments.append({"segment_index": segment_index, "start_frame": start, "end_frame": end - 1, "frame_count": len(segment), "overlap_frame_count": 0 if segment_index == 0 else min(args.segment_overlap, len(segment)), "inference_sec": profiler.timings.get("full_frame_inference", 0.0) - inference_before, "merge_sec": merge_sec, "elapsed_sec": time.perf_counter() - segment_started, "detected_frame_count": sum(d.visibility for d in detections)})
-        profiler.sample_memory(f"segment_{segment_index}_end")
-        del segment
+    reader = VideoSegmentReader(args.video_file, profiler, "full_frame")
+    try:
+        segment_iterator = reader.segments(segment_plan)
+        for segment_index, (start, end, segment) in enumerate(segment_iterator):
+            segment_started = time.perf_counter()
+            with profiler.stage("background_estimation"):
+                segment_background = estimate_frame_background(segment, args.background_sample_frames, profiler) if bg_mode else None
+            inference_before = profiler.timings.get("full_frame_inference", 0.0)
+            detections = run_tracknet_heatmap(frames_bgr=segment, frame_ids=list(range(start, start + len(segment))), model=tracknet, seq_len=tracknet_seq_len, bg_mode=bg_mode, batch_size=args.batch_size, threshold=args.strong_threshold, device=device, progress_desc=f"Full-frame segment {segment_index + 1}/{len(segment_plan)}", background_sample_frames=args.background_sample_frames, profiler=profiler, profile_prefix="full_frame", background_rgb=segment_background)
+            merge_started = time.perf_counter()
+            for detection in detections:
+                previous = full_by_frame.get(detection.frame)
+                if previous is None or detection.confidence > previous.confidence:
+                    full_by_frame[detection.frame] = detection
+            merge_sec = time.perf_counter() - merge_started
+            profiler.add_time("overlap_merge", merge_sec)
+            profiler.add_count("full_frame_processed_frames", len(segment))
+            profiler.segments.append({"segment_index": segment_index, "start_frame": start, "end_frame": end - 1, "frame_count": len(segment), "overlap_frame_count": 0 if segment_index == 0 else min(args.segment_overlap, len(segment)), "inference_sec": profiler.timings.get("full_frame_inference", 0.0) - inference_before, "merge_sec": merge_sec, "elapsed_sec": time.perf_counter() - segment_started, "detected_frame_count": sum(d.visibility for d in detections)})
+            profiler.sample_memory(f"segment_{segment_index}_end")
+    finally:
+        reader.close()
     full_dets = [full_by_frame.get(frame, HeatmapDetection(frame, 0, 0.0, 0.0, 0.0)) for frame in range(total_frames)]
     elapsed_full = time.perf_counter() - full_started
     full_df = pd.DataFrame(
@@ -548,6 +555,7 @@ def main() -> None:
     tile_inference_frame_count = 0
 
     if args.tiling_mode != "off":
+        tile_reader = VideoRangeReader(args.video_file, profiler)
         for supplement_range in ranges:
             range_started = time.perf_counter()
             range_tile_count = 0
@@ -562,11 +570,15 @@ def main() -> None:
                     args.corridor_margin,
                 ):
                     active_tiles[tile.index] = tile
+            with profiler.stage("tile_video_decode"):
+                range_buffer = tile_reader.read(range_frames[0], range_frames[-1] + 1)
+            with profiler.stage("background_estimation"):
+                range_background = estimate_frame_background(range_buffer, args.background_sample_frames, profiler) if bg_mode else None
             for tile in active_tiles.values():
                 range_tile_count += 1
-                with profiler.stage("video_decode"):
-                    range_buffer = read_frame_range(args.video_file, range_frames[0], range_frames[-1] + 1, profiler)
-                tile_frames = [frame[tile.y1:tile.y2, tile.x1:tile.x2] for frame in range_buffer]
+                with profiler.stage("tile_crop_generation"):
+                    tile_frames = [frame[tile.y1:tile.y2, tile.x1:tile.x2] for frame in range_buffer]
+                profiler.add_count("tile_crop_count", len(tile_frames))
                 detections = run_tracknet_heatmap(
                     frames_bgr=tile_frames,
                     frame_ids=range_frames,
@@ -580,10 +592,11 @@ def main() -> None:
                     offset=(tile.x1, tile.y1),
                     progress_desc=f"Tile {tile.index}",
                     profiler=profiler,
-                    profile_prefix="tile_recovery",
+                    profile_prefix="tile",
+                    background_rgb=None if range_background is None else range_background[tile.y1:tile.y2, tile.x1:tile.x2],
                 )
                 tile_inference_frame_count += len(tile_frames)
-                del tile_frames, range_buffer
+                del tile_frames
                 for det in detections:
                     if det.confidence < args.candidate_threshold:
                         continue
@@ -605,7 +618,9 @@ def main() -> None:
                             "RejectReason": "",
                         }
                     )
+            del range_buffer
             profiler.tile_intervals.append({"start_frame": supplement_range["start"], "end_frame": supplement_range["end"], "interval_ids": supplement_range["interval_ids"], "tile_count": range_tile_count, "processed_frames": len(range_frames) * range_tile_count, "elapsed_sec": time.perf_counter() - range_started})
+        tile_reader.close()
 
     elapsed_tile = time.perf_counter() - tile_started
     profiler.add_count("missing_interval_count", len(intervals))
@@ -712,6 +727,13 @@ def main() -> None:
         profiler.add_count("unique_source_frames", total_frames)
         profiler.add_count("overlap_reprocessed_frames", sum(max(0, item[1] - item[0]) for item in segment_plan) - total_frames)
         profiler.add_count("detected_frame_count", debug["final_visible_count"])
+        profiler.add_count("tile_inference_frame_times", tile_inference_frame_count)
+        profiler.counts.setdefault("background_source_decode_count", 0)
+        profiler.counts["total_source_decode_count"] = (
+            profiler.counts.get("background_source_decode_count", 0)
+            + profiler.counts.get("full_frame_source_decode_count", 0)
+            + profiler.counts.get("tile_source_decode_count", 0)
+        )
         profiler.finalize(save_dir / f"{video_stem}_performance_profile.json", device=device, video={"path": args.video_file, "width": width, "height": height, "fps": fps, "frame_count": total_frames, "duration_sec": total_frames / fps if fps else 0}, configuration={"segment_frames": args.segment_frames, "segment_overlap": args.segment_overlap, "segment_count": len(segment_plan), "batch_size": args.batch_size, "background_sample_frames": args.background_sample_frames, "tiling_mode": args.tiling_mode, "max_tiles": args.max_tiles})
 
     print("device =", device)

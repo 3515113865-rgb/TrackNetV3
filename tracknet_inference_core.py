@@ -2,16 +2,128 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable
+import time
 
 import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from PIL import Image
 
 from dataset import Shuttlecock_Trajectory_Dataset
 from test import get_ensemble_weight
 from utils.general import HEIGHT, WIDTH, get_model
+
+
+class VideoSegmentReader:
+    """Sequential bounded reader that reuses only the segment overlap."""
+
+    def __init__(self, video_file: str, profiler=None, purpose: str = "full_frame"):
+        self.cap = cv2.VideoCapture(video_file)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_file}")
+        self.profiler = profiler
+        self.purpose = purpose
+        self.tail: list[np.ndarray] = []
+        if profiler:
+            profiler.add_count("video_open_count")
+            profiler.add_count(f"video_open_{purpose}")
+
+    def segments(self, ranges: list[tuple[int, int]]):
+        previous_end = 0
+        for index, (start, end) in enumerate(ranges):
+            overlap = max(0, previous_end - start) if index else 0
+            frames = self.tail[-overlap:] if overlap else []
+            needed = end - start - len(frames)
+            decode_started = time.perf_counter()
+            for _ in range(needed):
+                ok, frame = self.cap.read()
+                if not ok:
+                    break
+                frames.append(frame)
+                if self.profiler:
+                    self.profiler.add_count("decoded_frame_count")
+                    self.profiler.add_count("full_frame_source_decode_count")
+            if self.profiler:
+                self.profiler.add_time("full_frame_video_decode", time.perf_counter() - decode_started)
+            self.tail = frames
+            previous_end = end
+            if self.profiler:
+                self.profiler.counts["segment_buffer_peak_frames"] = max(
+                    self.profiler.counts.get("segment_buffer_peak_frames", 0), len(frames)
+                )
+            yield start, end, frames
+
+    def close(self):
+        self.cap.release()
+
+
+class VideoRangeReader:
+    """One capture for bounded, non-overlapping recovery ranges."""
+
+    def __init__(self, video_file: str, profiler=None):
+        self.cap = cv2.VideoCapture(video_file)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_file}")
+        self.profiler = profiler
+        if profiler:
+            profiler.add_count("video_open_count")
+            profiler.add_count("video_open_tile_recovery")
+
+    def read(self, start: int, end: int) -> list[np.ndarray]:
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+        frames = []
+        for _ in range(start, end):
+            ok, frame = self.cap.read()
+            if not ok:
+                break
+            frames.append(frame)
+            if self.profiler:
+                self.profiler.add_count("decoded_frame_count")
+                self.profiler.add_count("tile_source_decode_count")
+        return frames
+
+    def close(self):
+        self.cap.release()
+
+
+def estimate_video_background(video_file: str, total_frames: int, max_samples: int, profiler=None):
+    cap = cv2.VideoCapture(video_file)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_file}")
+    if profiler:
+        profiler.add_count("video_open_count")
+        profiler.add_count("video_open_background")
+    sample_count = min(total_frames, max(1, max_samples))
+    indices = np.linspace(0, total_frames - 1, sample_count, dtype=int)
+    samples = []
+    try:
+        for frame_index in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            samples.append(frame[:, :, ::-1])
+            if profiler:
+                profiler.add_count("decoded_frame_count")
+                profiler.add_count("background_source_decode_count")
+    finally:
+        cap.release()
+    if profiler:
+        profiler.add_count("background_estimation_count")
+        profiler.add_count("background_sampled_frames", len(samples))
+    return np.median(samples, axis=0) if samples else None
+
+
+def estimate_frame_background(frames_bgr: list[np.ndarray], max_samples: int, profiler=None):
+    sample_count = min(len(frames_bgr), max(1, max_samples))
+    indices = np.linspace(0, len(frames_bgr) - 1, sample_count, dtype=int)
+    rgb = np.array([frames_bgr[index][:, :, ::-1] for index in indices])
+    if profiler:
+        profiler.add_count("background_estimation_count")
+        profiler.add_count("background_sampled_frames", sample_count)
+    return np.median(rgb, axis=0)
 
 
 @dataclass(frozen=True)
@@ -66,6 +178,7 @@ def read_video_frames(video_file: str) -> tuple[list[np.ndarray], float, int, in
 def video_metadata(video_file: str, profiler=None) -> tuple[int, float, int, int]:
     if profiler:
         profiler.add_count("video_open_count")
+        profiler.add_count("video_open_metadata")
     cap = cv2.VideoCapture(video_file)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_file}")
@@ -90,9 +203,10 @@ def segment_ranges(total_frames: int, segment_frames: int = 180, overlap: int = 
     return ranges
 
 
-def read_frame_range(video_file: str, start: int, end: int, profiler=None) -> list[np.ndarray]:
-    if profiler:
+def read_frame_range(video_file: str, start: int, end: int, profiler=None, purpose: str = "range", count_open: bool = True) -> list[np.ndarray]:
+    if profiler and count_open:
         profiler.add_count("video_open_count")
+        profiler.add_count(f"video_open_{purpose}")
     cap = cv2.VideoCapture(video_file)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_file}")
@@ -160,6 +274,7 @@ def run_tracknet_heatmap(
     background_sample_frames: int = 64,
     profiler=None,
     profile_prefix: str = "full_frame",
+    background_rgb: np.ndarray | None = None,
 ) -> list[HeatmapDetection]:
     pipeline_started = __import__("time").perf_counter()
     inference_before = profiler.timings.get(f"{profile_prefix}_inference", 0.0) if profiler else 0.0
@@ -173,17 +288,26 @@ def run_tracknet_heatmap(
     tile_h, tile_w = frames_bgr[0].shape[:2]
     img_scaler = (tile_w / WIDTH, tile_h / HEIGHT)
     stage = profiler.stage if profiler else None
-    with stage("background_estimation") if stage else _nullcontext():
-        rgb_frames = bgr_to_rgb_array(frames_bgr)
-        sample_count = min(len(rgb_frames), max(1, background_sample_frames))
-        sample_indices = np.linspace(0, len(rgb_frames) - 1, sample_count, dtype=int)
-        median = np.median(rgb_frames[sample_indices], axis=0) if bg_mode else None
-        if profiler and bg_mode:
-            profiler.add_count("background_estimation_count")
-            profiler.add_count("background_sampled_frames", sample_count)
-    with stage(f"{profile_prefix}_preparation") if stage else _nullcontext():
-        dataset = Shuttlecock_Trajectory_Dataset(seq_len=seq_len, sliding_step=1, data_mode="heatmap", bg_mode=bg_mode, frame_arr=rgb_frames, median=median)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, drop_last=False)
+    rgb_frames = bgr_to_rgb_array(frames_bgr)
+    median = background_rgb
+    preprocess_name = f"{profile_prefix}_preprocess"
+    with stage(preprocess_name) if stage else _nullcontext():
+        prepared = []
+        for rgb in rgb_frames:
+            if bg_mode == "subtract":
+                diff = np.sum(np.absolute(rgb - median), axis=2).astype("uint8")
+                resized = np.asarray(Image.fromarray(diff).resize((WIDTH, HEIGHT)))[None, ...]
+            elif bg_mode == "subtract_concat":
+                diff = np.sum(np.absolute(rgb - median), axis=2).astype("uint8")
+                resized_rgb = np.moveaxis(np.asarray(Image.fromarray(rgb).resize((WIDTH, HEIGHT))), -1, 0)
+                resized_diff = np.asarray(Image.fromarray(diff).resize((WIDTH, HEIGHT)))[None, ...]
+                resized = np.concatenate((resized_rgb, resized_diff), axis=0)
+            else:
+                resized = np.moveaxis(np.asarray(Image.fromarray(rgb).resize((WIDTH, HEIGHT))), -1, 0)
+            prepared.append(resized)
+        prepared = np.ascontiguousarray(np.stack(prepared))
+        if bg_mode == "concat":
+            resized_median = np.moveaxis(np.asarray(Image.fromarray(median.astype("uint8")).resize((WIDTH, HEIGHT))), -1, 0)
 
     video_len = len(frames_bgr)
     buffer_size = seq_len - 1
@@ -195,9 +319,23 @@ def run_tracknet_heatmap(
     sample_count = 0
     heatmaps_by_local_frame: dict[int, np.ndarray] = {}
 
+    starts = list(range(num_sample))
     with torch.no_grad():
-        for i, x in tqdm(loader, desc=progress_desc):
-            x = x.float().to(device)
+        for batch_start in tqdm(range(0, num_sample, batch_size), desc=progress_desc):
+            batch_starts = starts[batch_start:batch_start + batch_size]
+            with stage(f"{profile_prefix}_preparation") if stage else _nullcontext():
+                arrays = []
+                indices = []
+                for start in batch_starts:
+                    window = prepared[start:start + seq_len].reshape(-1, HEIGHT, WIDTH)
+                    if bg_mode == "concat":
+                        window = np.concatenate((resized_median, window), axis=0)
+                    arrays.append(window)
+                    indices.append([(0, frame) for frame in range(start, start + seq_len)])
+                x = torch.from_numpy(np.ascontiguousarray(np.stack(arrays))).float().div_(255.0)
+                i = torch.tensor(indices, dtype=torch.int64)
+            with stage(f"{profile_prefix}_host_to_device", synchronize_cuda=True) if stage else _nullcontext():
+                x = x.pin_memory().to(device, non_blocking=True) if device.type == "cuda" else x.to(device)
             if profiler:
                 profiler.observe_inference(model, x)
             with stage(f"{profile_prefix}_inference", synchronize_cuda=True) if stage else _nullcontext():
@@ -241,12 +379,6 @@ def run_tracknet_heatmap(
                         offset=offset,
                     )
                 )
-    if profiler:
-        pipeline_elapsed = __import__("time").perf_counter() - pipeline_started
-        inference_elapsed = profiler.timings.get(f"{profile_prefix}_inference", 0.0) - inference_before
-        background_elapsed = profiler.timings.get("background_estimation", 0.0) - background_before
-        measured_setup = profiler.timings.get(f"{profile_prefix}_preparation", 0.0) - preparation_before
-        profiler.add_time(f"{profile_prefix}_preparation", max(0.0, pipeline_elapsed - inference_elapsed - background_elapsed - measured_setup))
     return detections
 
 
